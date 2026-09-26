@@ -1,0 +1,438 @@
+rules_version = '2';
+
+// Aturan untuk koleksi `repos` (Tahap 2 — Sistem Code Sharing).
+//
+// Model akses yang dipakai (selaras dengan FAQ di landing page):
+// - Repo publik: bisa dibaca & muncul di daftar "Jelajahi" oleh siapa saja
+//   yang sudah login ke TSC.
+// - Repo privat: TIDAK muncul di listing manapun (query `list` diblokir
+//   kecuali kamu pemiliknya), tapi tetap bisa dibuka lewat link langsung
+//   (operasi `get` satu dokumen, oleh siapa saja yang sudah login) — sesuai
+//   janji "kode privat hanya bisa dilihat lewat link".
+// - Hanya pemilik yang boleh mengubah file/metadata/menghapus repo.
+// - Star & views count boleh diubah pengguna lain, tapi field lain di
+//   dokumen repo tidak boleh ikut berubah dalam request yang sama (jaga dari
+//   penyalahgunaan endpoint star/view untuk mengedit punya orang).
+//
+// PENTING: ini titik awal yang wajar, bukan aturan final. Sebelum dipakai
+// di produksi, tes dulu lewat Firebase Console > Firestore > Rules
+// Playground dengan skenario: baca repo publik, baca repo privat langsung
+// vs lewat query, tulis oleh bukan-pemilik, dst.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isOwner(resource) {
+  return isSignedIn() && resource.data.ownerId == request.auth.uid;
+}
+
+// Dipakai buat admin dashboard (Tahap 5): baca role dari dokumen profil
+// milik requester sendiri. Butuh koleksi `users` (lihat match di bawah).
+function isAdmin() {
+  return isSignedIn() &&
+    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+}
+
+// True jika request update HANYA menyentuh starsCount dan/atau viewsCount
+// (dipakai endpoint toggleStar / incrementViews yang dijalankan bukan-pemilik).
+function onlyTouchesCountersField() {
+  let changed = request.resource.data.diff(resource.data).affectedKeys();
+  return changed.hasOnly(['starsCount', 'viewsCount', 'updatedAt']);
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /repos/{repoId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() &&
+        (resource.data.visibility == 'public' || resource.data.ownerId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+
+      allow update: if isOwner(resource) || (isSignedIn() && onlyTouchesCountersField());
+
+      allow delete: if isOwner(resource) || isAdmin();
+
+      match /stars/{uid} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == uid;
+      }
+
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      }
+
+      // Riwayat versi (commit) — imutable. Cuma pemilik yang bisa nulis
+      // (lewat RepoService.commit), tidak ada aturan update/delete jadi
+      // riwayat tidak bisa diubah/dihapus siapa pun setelah tercatat.
+      match /commits/{commitId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() &&
+          get(/databases/$(database)/documents/repos/$(repoId)).data.ownerId == request.auth.uid;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Buku pembelajaran (Tahap 3)
+    // Model akses sama seperti repos: publik = terbaca & terlisting oleh
+    // siapa saja yang login; privat = tidak terlisting, tapi tetap bisa
+    // dibuka langsung lewat link. Hanya pemilik yang boleh menulis
+    // metadata/bab. Progress baca (`progress/{uid}`) murni milik masing-
+    // masing pembaca — pemilik buku TIDAK otomatis bisa membaca progress
+    // orang lain lewat rules ini.
+    // ---------------------------------------------------------------
+    function isBookEditor(bookId) {
+      let book = get(/databases/$(database)/documents/books/$(bookId));
+      return isSignedIn() &&
+        (book.data.ownerId == request.auth.uid ||
+         (request.auth.uid in book.data.coAuthorIds));
+    }
+
+    match /books/{bookId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() &&
+        (resource.data.visibility == 'public' || resource.data.ownerId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+      // Cuma pemilik yang boleh ubah metadata buku (judul, visibilitas,
+      // daftar kolaborator, dst) — kolaborator TIDAK bisa mengubah ini,
+      // cuma bisa menulis isi bab (lihat rules /chapters di bawah).
+      allow update: if isOwner(resource);
+      allow delete: if isOwner(resource) || isAdmin();
+
+      match /chapters/{chapterId} {
+        allow read: if isSignedIn();
+        allow write: if isBookEditor(bookId);
+      }
+
+      match /progress/{uid} {
+        allow read, write: if isSignedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Grup (Tahap 4)
+    // ---------------------------------------------------------------
+    function isGroupAdmin(groupId) {
+      let m = get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+      return isSignedIn() && m.data.role in ['owner', 'admin'];
+    }
+
+    function isGroupMember(groupId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    function onlyTouchesActivityFields() {
+      // memberCount berubah saat orang join/keluar; lastMessageAt
+      // di-bump anggota mana pun saat mereka kirim pesan (dipakai badge
+      // notifikasi belum-dibaca) — keduanya field aktivitas ringan, bukan
+      // data sensitif, jadi sengaja dibuka untuk siapa pun yang login,
+      // bukan cuma admin grup.
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['memberCount', 'updatedAt', 'lastMessageAt']);
+    }
+
+    match /groups/{groupId} {
+      // Get selalu boleh (dibutuhkan buat menampilkan layar "Gabung grup"
+      // sebelum seseorang jadi member). List (muncul di listing/browse)
+      // hanya untuk grup yang tidak diset "Lewat link saja", kecuali
+      // punya sendiri.
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() &&
+        (resource.data.joinMethod != 'link' || resource.data.ownerId == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isSignedIn() &&
+        (resource.data.ownerId == request.auth.uid || isGroupAdmin(groupId) || onlyTouchesActivityFields());
+      allow delete: if isSignedIn() && (resource.data.ownerId == request.auth.uid || isAdmin());
+
+      match /members/{memberId} {
+        allow get: if isSignedIn();
+        allow list: if isGroupMember(groupId);
+        // Join langsung (public/link) — orang menambahkan dirinya sendiri.
+        // Selain itu (approve, promote, remove) hanya owner/admin.
+        allow create: if isSignedIn() &&
+          ((request.auth.uid == memberId &&
+            get(/databases/$(database)/documents/groups/$(groupId)).data.joinMethod in ['public', 'link']) ||
+           isGroupAdmin(groupId));
+        // Menandai diri sendiri "sudah baca" (lastReadAt) boleh siapa pun
+        // atas dokumen membernya sendiri; promote/demote/keluarkan orang
+        // lain tetap khusus admin.
+        allow update: if isGroupAdmin(groupId) ||
+          (isSignedIn() && request.auth.uid == memberId &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastReadAt']));
+        allow delete: if isGroupAdmin(groupId);
+      }
+
+      match /joinRequests/{uid} {
+        allow create: if isSignedIn() && request.auth.uid == uid;
+        allow read, delete: if isSignedIn() && (request.auth.uid == uid || isGroupAdmin(groupId));
+      }
+
+      match /channels/{channelId} {
+        allow read: if isGroupMember(groupId);
+        allow write: if isGroupAdmin(groupId);
+
+        match /messages/{messageId} {
+          allow read: if isGroupMember(groupId);
+          allow create: if isGroupMember(groupId) && request.resource.data.userId == request.auth.uid;
+          // Pemilik pesan boleh ubah field apa saja miliknya sendiri
+          // (termasuk attachment.scanStatus lewat Cloud Function — tapi
+          // itu pakai Admin SDK yang otomatis lewat semua rules, jadi
+          // baris ini murni buat aksi dari client seperti edit teks/pin).
+          allow update, delete: if isSignedIn() &&
+            (resource.data.userId == request.auth.uid || isGroupAdmin(groupId));
+        }
+
+        // Voice channel: siapa masuk (presence) + sinyal WebRTC per pasangan.
+        match /voiceParticipants/{uid} {
+          allow read: if isGroupMember(groupId);
+          allow write: if isSignedIn() && request.auth.uid == uid && isGroupMember(groupId);
+        }
+
+        match /voiceCalls/{callId} {
+          allow read, write: if isGroupMember(groupId);
+
+          match /callerCandidates/{candidateId} {
+            allow read, write: if isGroupMember(groupId);
+          }
+          match /calleeCandidates/{candidateId} {
+            allow read, write: if isGroupMember(groupId);
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Kotak Pesan / DM (Tahap 4)
+    // ---------------------------------------------------------------
+    match /conversations/{conversationId} {
+      allow read: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+      allow create: if isSignedIn() && request.auth.uid in request.resource.data.participantIds;
+      allow update: if isSignedIn() && request.auth.uid in resource.data.participantIds;
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn() &&
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+        allow create: if isSignedIn() &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantIds;
+        // Cuma pengirim yang boleh edit pesannya sendiri (dipakai fitur
+        // edit pesan), dan cuma field text/edited yang boleh berubah.
+        allow update: if isSignedIn() && resource.data.senderId == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'edited']);
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Profil pengguna & admin dashboard (Tahap 5)
+    // ---------------------------------------------------------------
+    function onlyTouchesOwnSyncFields() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly([
+        'name', 'email', 'photoURL',
+        'username', 'bio', 'dob', 'purpose', 'occupation', 'occupationOther',
+        'personalFirebaseConfig', 'onboardingComplete',
+        // Fitur Edit Profil (lihat UserService.updateProfileDetails) —
+        // SEMUANYA self-editable KECUALI 'verified' dan 'badge', yang
+        // sengaja TIDAK ada di daftar ini supaya cuma admin (isAdmin())
+        // yang bisa mencentang verifikasi/memberi badge custom — bukan
+        // pengguna itu sendiri.
+        'bannerURL', 'avatarShape', 'websiteUrl', 'links',
+        'contactEmail', 'hideContactEmail', 'whatsapp',
+        'profileCategory', 'location',
+        'themeColor', 'visibility', 'hideLocation', 'hideLastActive', 'lastActiveAt',
+        'pinnedPostId', 'highlightPostIds'
+      ]);
+    }
+
+    match /users/{uid} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && request.auth.uid == uid;
+      // Pengguna biasa boleh mengisi profil & data onboarding miliknya
+      // sendiri (nama, username, bio, dsb) — TAPI TIDAK BISA mengubah
+      // role/status sendiri (jadi tidak bisa self-promote ke admin atau
+      // membatalkan suspend sendiri). Hanya admin yang bisa mengubah
+      // field apa saja, termasuk role & status akun manapun.
+      allow update: if isAdmin() ||
+        (isSignedIn() && request.auth.uid == uid && onlyTouchesOwnSyncFields());
+      allow delete: if isAdmin();
+    }
+
+    // Username unik (handle publik) — dokumen ID = username huruf kecil.
+    // Sama prinsipnya dengan emailIndex: cek ketersediaan lewat get()
+    // langsung (bukan list), dan cuma boleh diklaim/dilepas oleh
+    // pemiliknya sendiri (uid di dalam dokumen harus cocok requester).
+    match /usernames/{username} {
+      allow get: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Indeks email -> uid, dipakai fitur "undang kolaborator buku lewat
+    // email" (lib/users.ts findUidByEmail) tanpa perlu izin "list semua
+    // pengguna". Document ID = email (huruf kecil semua). Ditulis
+    // otomatis tiap kali seseorang login/register (ensureProfile).
+    //
+    // Yang dijaga di sini: seseorang HANYA boleh menulis entri untuk
+    // emailnya SENDIRI (dicocokkan ke email di token Auth-nya) — supaya
+    // tidak ada yang bisa membajak entri email orang lain dan
+    // mengalihkan undangan kolaborator ke akun sendiri.
+    match /emailIndex/{email} {
+      allow get: if isSignedIn();
+      allow write: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        request.auth.token.email is string &&
+        request.auth.token.email.lower() == email;
+    }
+
+    // Pengaturan global situs (mis. config/postLimits.maxTags — batas
+    // kategori per postingan yang bisa diturunkan admin saat trafik ramai).
+    // Dibaca semua pengguna login (dipakai form buat postingan), ditulis
+    // cuma admin.
+    match /config/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow get, list: if isAdmin();
+      allow update: if isAdmin();
+    }
+
+    // Metadata API key pihak ketiga (Supabase, Gemini, dst) — NILAI ASLI
+    // TIDAK PERNAH ada di sini, cuma preview ter-mask. Ditulis eksklusif
+    // lewat Cloud Function saveApiKey/deleteApiKey (pakai Admin SDK yang
+    // otomatis melewati semua rules ini) — makanya `write` di-set false
+    // total, tidak ada celah client menulis langsung ke koleksi ini.
+    match /apiKeyMeta/{keyId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // Log moderasi AI — ditulis eksklusif oleh Cloud Function
+    // moderateNewGroupMessage (Admin SDK, lewat semua rules). Cuma admin
+    // yang boleh baca (buat audit), tidak ada yang bisa nulis dari client.
+    match /moderationLog/{logId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // Postingan (ala Reddit) + Follow (ala Twitter)
+    // ---------------------------------------------------------------
+    function onlyTouchesScore() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['score']);
+    }
+
+    function onlyTouchesCommentCount() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['commentsCount']);
+    }
+
+    match /posts/{postId} {
+      allow read: if isSignedIn();
+      // Batas jumlah tag (2-7) ditegakkan di sini sebagai jaring pengaman
+      // mutlak — bukan cuma di UI (lib/postCategories.ts + TagPicker).
+      // Batas MAKSIMAL yang bisa diturunkan admin lewat config/postLimits
+      // (mis. jadi 2-3 saat trafik ramai) itu penyempitan tambahan di
+      // level UI; di rules ini 7 tetap jadi plafon paling atas yang
+      // tidak pernah dilewati siapa pun, termasuk kalau ada yang coba
+      // panggil API langsung skip UI.
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid &&
+        request.resource.data.tags.size() >= 2 && request.resource.data.tags.size() <= 7;
+      allow update: if isSignedIn() &&
+        ((resource.data.authorId == request.auth.uid &&
+          request.resource.data.tags.size() >= 2 && request.resource.data.tags.size() <= 7) ||
+         onlyTouchesScore() || onlyTouchesCommentCount());
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /votes/{uid} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == uid;
+      }
+
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      }
+    }
+
+    match /follows/{followId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.followerUid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.followerUid == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------
+    // Modul besar baru: Showcase, Tama Clips, Job Match, Skill Tree
+    // ---------------------------------------------------------------
+    function onlyTouchesLikeCount() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['likesCount']);
+    }
+
+    function onlyTouchesUpvoteCount() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return changed.hasOnly(['upvotesCount']);
+    }
+
+    match /showcase/{itemId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn() &&
+        (resource.data.authorId == request.auth.uid || onlyTouchesLikeCount());
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /likes/{uid} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == uid;
+      }
+    }
+
+    match /clips/{clipId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn() &&
+        (resource.data.authorId == request.auth.uid || onlyTouchesUpvoteCount());
+      allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid || isAdmin());
+
+      match /upvotes/{uid} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == uid;
+      }
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.posterId == request.auth.uid;
+      allow update, delete: if isSignedIn() && (resource.data.posterId == request.auth.uid || isAdmin());
+
+      match /applications/{applicantId} {
+        // Cuma pemasang lowongan yang boleh baca daftar pelamar; pelamar
+        // sendiri boleh baca/tulis lamarannya sendiri (buat cek status
+        // "sudah melamar").
+        allow read: if isSignedIn() &&
+          (request.auth.uid == applicantId ||
+           get(/databases/$(database)/documents/jobs/$(jobId)).data.posterId == request.auth.uid);
+        allow create: if isSignedIn() && request.auth.uid == applicantId;
+      }
+    }
+
+    // Progress skill tree (dibaca lewat subkoleksi users/{uid}/skills) —
+    // aturan lengkap koleksi `users` ada di match /users/{uid} di atas;
+    // ini nambah akses ke subkoleksinya.
+    match /users/{uid}/skills/{skillId} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+  }
+}
