@@ -1,0 +1,15 @@
+# Static export can only pre-render ONE placeholder page per dynamic
+# route ([id], [uid], etc.) because the real ids live in Firestore and
+# are only known in the browser. These rules send any real id straight
+# to that placeholder's HTML shell; the page then reads the actual id
+# from the URL client-side via useParams() and fetches from Firestore.
+# Netlify serves a real file over a redirect automatically, so already
+# static pages (e.g. /dashboard/grup/baru/) are unaffected.
+
+/dashboard/grup/*        /dashboard/grup/_/index.html        200
+/dashboard/karir/*       /dashboard/karir/_/index.html       200
+/dashboard/kelas/*       /dashboard/kelas/_/index.html       200
+/dashboard/kode/*        /dashboard/kode/_/index.html        200
+/dashboard/postingan/*   /dashboard/postingan/_/index.html   200
+/dashboard/showcase/*    /dashboard/showcase/_/index.html    200
+/dashboard/u/*           /dashboard/u/_/index.html           200
