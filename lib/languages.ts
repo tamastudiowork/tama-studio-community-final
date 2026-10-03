@@ -4,12 +4,19 @@
 // (Monaco tokenizer generik), sesuai kesepakatan scope v1.
 // ===================================================================
 
+export type PriorityLanguage = {
+  id: string;
+  label: string;
+  ext: string[];
+  runtime?: { language: string; version: string };
+};
+
 /**
  * Top 30 bahasa terpopuler (kombinasi indikator TIOBE / Stack Overflow /
  * GitHub Octoverse terbaru) — semua ini sudah native didukung Monaco Editor
  * dengan tokenizer & bracket-matching penuh, jadi tidak perlu grammar tambahan.
  */
-export const PRIORITY_LANGUAGES = [
+export const PRIORITY_LANGUAGES: PriorityLanguage[] = [
   { id: 'javascript', label: 'JavaScript', ext: ['.js', '.mjs', '.cjs', '.jsx'], runtime: { language: 'javascript', version: '18.15.0' } },
   { id: 'typescript', label: 'TypeScript', ext: ['.ts', '.tsx'], runtime: { language: 'typescript', version: '5.0.3' } },
   { id: 'python', label: 'Python', ext: ['.py', '.pyw'], runtime: { language: 'python', version: '3.10.0' } },
@@ -42,7 +49,7 @@ export const PRIORITY_LANGUAGES = [
   { id: 'dockerfile', label: 'Dockerfile', ext: ['Dockerfile'] },
 ];
 
-const EXT_TO_LANGUAGE = PRIORITY_LANGUAGES.reduce((map, lang) => {
+const EXT_TO_LANGUAGE = PRIORITY_LANGUAGES.reduce<Record<string, string>>((map, lang) => {
   lang.ext.forEach((ext) => {
     map[ext.toLowerCase()] = lang.id;
   });
@@ -54,7 +61,7 @@ const EXT_TO_LANGUAGE = PRIORITY_LANGUAGES.reduce((map, lang) => {
  * 'plaintext' — file tetap terbuka & bisa diedit, hanya tanpa highlighting
  * berwarna (fallback yang disepakati untuk v1).
  */
-export function detectLanguage(filename) {
+export function detectLanguage(filename?: string | null): string {
   if (!filename) return 'plaintext';
   const lower = filename.toLowerCase();
 
@@ -67,13 +74,13 @@ export function detectLanguage(filename) {
   return EXT_TO_LANGUAGE[ext] || 'plaintext';
 }
 
-export function isPriorityLanguage(languageId) {
+export function isPriorityLanguage(languageId: string): boolean {
   return PRIORITY_LANGUAGES.some((lang) => lang.id === languageId);
 }
 
 /** Ekstensi default untuk bahasa tertentu — dipakai saat user memilih bahasa
  *  langsung dari dropdown "File Baru" (bukan mengetik nama file manual). */
-export function defaultExtensionFor(languageId) {
+export function defaultExtensionFor(languageId: string): string {
   const lang = PRIORITY_LANGUAGES.find((l) => l.id === languageId);
   if (!lang) return '';
   const ext = lang.ext[0];
@@ -82,6 +89,6 @@ export function defaultExtensionFor(languageId) {
 
 /** Cek apakah suatu bahasa punya runtime eksekusi (bisa di-Run), atau
  *  hanya bahasa markup/config yang tidak bisa dijalankan. */
-export function getRuntimeFor(languageId) {
+export function getRuntimeFor(languageId: string): { language: string; version: string } | null {
   return PRIORITY_LANGUAGES.find((l) => l.id === languageId)?.runtime || null;
 }
